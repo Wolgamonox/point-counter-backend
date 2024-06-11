@@ -4,5 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-serde = "1.0.203"
+color-eyre = "0.6.3"
+serde = { version = "1.0.203", features = ["derive"] }
+serde_json = "1.0.117"
+serial_int = "2.0.1"
+sqids = "0.4.1"
 tungstenite = "0.23.0"
