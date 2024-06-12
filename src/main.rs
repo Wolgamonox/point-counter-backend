@@ -1,22 +1,19 @@
-#![allow(dead_code)]
-#![allow(unused_imports)]
+// #![allow(dead_code)]
+// #![allow(unused_imports)]
 
-use serde::de::value::Error;
 use std::net::TcpListener;
-use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::spawn;
-use tungstenite::http::request;
 use tungstenite::{accept, Message};
 
-use color_eyre::eyre::{eyre, Result};
+use color_eyre::eyre::{eyre, Context, Result};
 
 use serial_int::SerialGenerator;
 
 use serde::{Deserialize, Serialize};
-use serde_json;
+use serde_json::{self, json, to_string};
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Player {
     name: String,
     points: i32,
@@ -38,7 +35,7 @@ fn generate_id() -> u32 {
         .generate()
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Game {
     id: u32,
     players: Vec<Player>,
@@ -106,14 +103,16 @@ enum Request {
     },
 }
 
-fn process_request(request: Request, games: &mut Vec<Game>) -> Result<()> {
+fn process_request(request: Request, games: &mut Vec<Game>) -> Result<String> {
     match request {
         Request::CreateGame { player_name } => {
             let mut new_game = Game::new();
             new_game.add_player(player_name)?;
-            games.push(new_game);
 
-            Ok(())
+            let response = to_string(&new_game).expect("Game should be parsable");
+
+            games.push(new_game);
+            Ok(response)
         }
         Request::JoinGame {
             player_name,
@@ -122,7 +121,11 @@ fn process_request(request: Request, games: &mut Vec<Game>) -> Result<()> {
             let game = games.iter_mut().find(|g| g.id == game_id);
 
             match game {
-                Some(game) => game.add_player(player_name),
+                Some(game) => {
+                    game.add_player(player_name)?;
+                    let response = to_string(game).expect("Game should be parsable");
+                    Ok(response)
+                }
                 None => Err(eyre!("Game not found.")),
             }
         }
@@ -134,7 +137,11 @@ fn process_request(request: Request, games: &mut Vec<Game>) -> Result<()> {
             let game = games.iter_mut().find(|g| g.id == game_id);
 
             match game {
-                Some(game) => game.change_points(player_name, new_points),
+                Some(game) => {
+                    game.change_points(player_name, new_points)?;
+                    let response = to_string(game).expect("Game should be parsable");
+                    Ok(response)
+                }
                 None => Err(eyre!("Game not found.")),
             }
         }
@@ -145,7 +152,11 @@ fn process_request(request: Request, games: &mut Vec<Game>) -> Result<()> {
             let game = games.iter_mut().find(|g| g.id == game_id);
 
             match game {
-                Some(game) => game.remove_player(player_name),
+                Some(game) => {
+                    game.remove_player(player_name)?;
+                    let response = to_string(game).expect("Game should be parsable");
+                    Ok(response)
+                }
                 None => Err(eyre!("Game not found.")),
             }
         }
@@ -155,7 +166,8 @@ fn process_request(request: Request, games: &mut Vec<Game>) -> Result<()> {
 fn parse_message(msg: Message) -> Result<Request> {
     let content = msg.clone().into_text()?;
 
-    let msg = serde_json::from_str(content.as_str())?;
+    let msg = serde_json::from_str(content.as_str())
+        .wrap_err_with(|| format!("Failed to parse request: {}", content))?;
     Ok(msg)
 }
 
@@ -173,32 +185,18 @@ fn main() -> Result<()> {
         spawn(move || {
             let mut websocket = accept(stream.unwrap()).unwrap();
             loop {
-                let read_result = websocket.read();
-
-                // Handles close message
-                let msg = match read_result {
-                    Ok(msg) => Some(msg),
-                    Err(_) => None,
-                };
-
-                if msg.is_none() {
+                let Ok(msg) = websocket.read() else {
+                    // Break on connection close
                     break;
-                }
-
-                let msg = msg.unwrap();
+                };
 
                 if msg.is_binary() || msg.is_text() {
                     let mut games = games.lock().unwrap();
 
-                    let result = parse_message(msg)
-                        .and_then(|request| process_request(request, &mut *games));
+                    let result = parse_message(msg).and_then(|r| process_request(r, &mut *games));
 
-
-                    // TODO: custom response that are parsable by the app
-                    let response = match result {
-                        Ok(_) => "OK".to_string(),
-                        Err(err) => err.to_string(),
-                    };
+                    let response =
+                        result.unwrap_or_else(|err| json!({"error": err.to_string()}).to_string());
 
                     // TODO: handle receiving messages from other channels
 
@@ -212,3 +210,36 @@ fn main() -> Result<()> {
 
     Ok(())
 }
+
+// Examples:
+
+// println!(
+//     "{}",
+//     to_string(&Request::CreateGame {
+//         player_name: "Gaston".to_string()
+//     })
+//     .unwrap()
+// );
+
+// println!(
+//     "{}",
+//     to_string(&Request::JoinGame {
+//         game_id: 0,
+//         player_name: "Theo".to_string()
+//     })
+//     .unwrap()
+// );
+
+// println!(
+//     "{}",
+//     to_string(&Request::PointChange {
+//         game_id: 0,
+//         player_name: "Gaston".to_string(),
+//         new_points: 10,
+//     })
+//     .unwrap()
+// );
+
+// {"CreateGame":{"player_name":"Gaston"}}
+// {"JoinGame":{"game_id":0,"player_name":"Theo"}}
+// {"PointChange":{"game_id":0,"player_name":"Gaston","new_points":10}}
