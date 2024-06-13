@@ -1,23 +1,14 @@
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
+use std::{io, net::SocketAddr};
 
-use std::{
-    clone,
-    collections::HashMap,
-    sync::{Mutex, OnceLock},
-    thread,
-    time::Duration,
-};
-
-use color_eyre::eyre::{eyre, Context, Result};
-use serial_int::SerialGenerator;
 use tokio::{
-    sync::{broadcast, mpsc},
-    time,
+    net::{TcpListener, TcpStream},
+    sync::{mpsc, oneshot},
 };
 
-#[derive(Debug, Clone)]
+use futures_util::{pin_mut, StreamExt, TryStreamExt};
+use tungstenite::Message;
+
+#[derive(Debug)]
 struct Player {
     name: String,
     points: i32,
@@ -29,159 +20,126 @@ impl Player {
     }
 }
 
-static ID_GENERATOR: OnceLock<Mutex<SerialGenerator<u32>>> = OnceLock::new();
-
-fn generate_id() -> u32 {
-    ID_GENERATOR
-        .get_or_init(|| Mutex::new(SerialGenerator::<u32>::new()))
-        .lock()
-        .expect("A thread panicked while trying to generate an ID.")
-        .generate()
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Game {
     players: Vec<Player>,
 }
 
 impl Game {
-    fn new() -> Game {
-        Game { players: vec![] }
-    }
-
-    fn with_player(player: Player) -> Game {
+    fn new(player_name: String) -> Game {
         Game {
-            players: vec![player],
+            players: vec![Player::new(player_name)],
         }
     }
 }
 
+type GameChannelSender = mpsc::Sender<Game>;
+type CommandSender = oneshot::Sender<GameChannelSender>;
+type ManagerChannelSender = mpsc::Sender<Command>;
+
 #[derive(Debug)]
-enum PlayerEvent {
-    CreateGame,
-    JoinGame {
-        game_id: u32,
+enum Command {
+    CreateGame {
         player_name: String,
+        game_channel_resp: CommandSender,
     },
-    PointChange {
-        game_id: u32,
-        player_name: String,
-        new_points: i32,
-    },
+}
+
+async fn process_incoming(
+    msg: Message,
+    manager_tx: &ManagerChannelSender,
+) -> Result<(), tungstenite::Error> {
+    println!("Received a message: {}", msg.to_text().unwrap());
+
+    if msg.to_text().unwrap() == "CreateGame".to_string() {
+        println!("Asking game manager to create a game...");
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = Command::CreateGame {
+            player_name: "TestPlayer".to_string(),
+            game_channel_resp: resp_tx,
+        };
+
+        // Send the GET request
+        manager_tx.send(cmd).await.unwrap();
+
+        // Await the response
+        let res = resp_rx.await;
+        println!("GOT = {:?}", res);
+    }
+
+    Ok(())
+}
+
+async fn handle_connection(
+    raw_stream: TcpStream,
+    manager_tx: ManagerChannelSender,
+    addr: SocketAddr,
+) {
+    println!("Incoming TCP connection from: {}", addr);
+
+    let ws_stream = tokio_tungstenite::accept_async(raw_stream)
+        .await
+        .expect("Error during the websocket handshake occurred");
+    println!("WebSocket connection established: {}", addr);
+
+    let (outgoing, incoming) = ws_stream.split();
+
+    // Handle messages incoming from the client
+    // if the message is CreateGame or JoinGame, send to the game manager channel
+    // else if the messages are related to point change, send to game channel if it exists
+    let incoming_processed = incoming.try_for_each(|msg| process_incoming(msg, &manager_tx));
+
+    // let receive_from_others = rx.map(Ok).forward(outgoing);
+
+    pin_mut!(incoming_processed);
+    incoming_processed.await.unwrap();
+
+    println!("{} disconnected", &addr);
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    color_eyre::install()?;
+async fn main() -> Result<(), io::Error> {
+    let addr = "127.0.0.1:8080";
 
-    let (game_update_tx, game_update_rx) = broadcast::channel::<Game>(16);
+    // Create the event loop and TCP listener we'll accept connections on.
+    let try_socket = TcpListener::bind(&addr).await;
+    let listener = try_socket.expect("Failed to bind");
+    println!("Listening on: {}", addr);
 
-    let (player_chan_tx_original, mut player_chan_rx) = mpsc::channel::<PlayerEvent>(100);
+    // Game manager channel
+    let (manager_tx, mut manager_rx) = mpsc::channel(16);
 
-    // Start thread of game manager
+    // Spawn game manager thread
     tokio::spawn(async move {
-        let mut games: HashMap<u32, Game> = HashMap::new();
-
-        //TODO proper error handlings
-
-        // Handle incoming events
-        while let Some(event) = player_chan_rx.recv().await {
-            println!("got = {:?}", &event);
-
-            match event {
-                PlayerEvent::CreateGame => {
-                    games.insert(generate_id(), Game::new());
-                }
-                PlayerEvent::JoinGame {
-                    game_id,
+        // TODO record games in a hash map here
+        while let Some(cmd) = manager_rx.recv().await {
+            println!("Game manager received cmd {:?}", cmd);
+            match cmd {
+                Command::CreateGame {
                     player_name,
+                    game_channel_resp,
                 } => {
-                    //TODO check max amount of players
-                    let game = games.get_mut(&game_id).unwrap();
-                    game.players.push(Player::new(player_name));
-                }
-                PlayerEvent::PointChange {
-                    game_id,
-                    player_name,
-                    new_points,
-                } => {
-                    let game = games.get_mut(&game_id).unwrap();
-                    let player = game
-                        .players
-                        .iter_mut()
-                        .find(|p| p.name == player_name)
-                        .unwrap();
+                    // TODO handle errors
 
-                    player.points = new_points;
+                    // New game channel
+                    let (game_channel_tx, mut game_channel_rx) = mpsc::channel(10);
+
+                    // Spawn new game thread
+                    tokio::spawn(async move {
+                        let game = Game::new(player_name);
+                    });
+
+                    let _ = game_channel_resp.send(game_channel_tx);
                 }
             }
-
-            println!("Games: {games:?}");
-
-            // TODO: Notify all players in the game
         }
     });
 
-    // Spawn a thread for each player connection
-    for i in 0..3 {
-        println!("New player connected");
-        let mut game_update_rx = game_update_tx.subscribe();
-        let player_chan_tx = player_chan_tx_original.clone();
-
-        // Thread 1 handles the receiving of game updates
-        tokio::spawn(async move {
-            while let Ok(game) = game_update_rx.recv().await {
-                println!("Receiver {i} got: {game:?}");
-            }
-        });
-
-        // Thread 2 handles the sending of player events
-        tokio::spawn(async move {
-            player_chan_tx.send(PlayerEvent::CreateGame).await.unwrap();
-        });
+    // Let's spawn the handling of each connection in a separate task.
+    while let Ok((stream, addr)) = listener.accept().await {
+        let new_manager_tx = manager_tx.clone();
+        tokio::spawn(handle_connection(stream, new_manager_tx, addr));
     }
-
-    // game_update_tx.send(Game::new())?;
-    // game_update_tx.send(Game::new())?;
-
-    // let player_chan_tx_new = player_chan_tx.clone();
-
-    // player_chan_tx_new.send(PlayerEvent::CreateGame).await?;
-    // time::sleep(Duration::from_secs(1)).await;
-    // player_chan_tx_new
-    //     .send(PlayerEvent::JoinGame {
-    //         game_id: 0,
-    //         player_name: "Gaston".to_string(),
-    //     })
-    //     .await?;
-    // time::sleep(Duration::from_secs(1)).await;
-    // player_chan_tx_new
-    //     .send(PlayerEvent::PointChange {
-    //         game_id: 0,
-    //         player_name: "Gaston".to_string(),
-    //         new_points: 15,
-    //     })
-    //     .await?;
-    // time::sleep(Duration::from_secs(1)).await;
-
-    // player_chan_tx
-    //     .send(PlayerEvent::JoinGame {
-    //         game_id: 0,
-    //         player_name: "Theo".to_string(),
-    //     })
-    //     .await?;
-    // time::sleep(Duration::from_secs(1)).await;
-    // player_chan_tx
-    //     .send(PlayerEvent::PointChange {
-    //         game_id: 0,
-    //         player_name: "Theo".to_string(),
-    //         new_points: 15,
-    //     })
-    //     .await?;
-    // time::sleep(Duration::from_secs(1)).await;
-
-    // Leave time for program to receive everything
-    time::sleep(Duration::from_secs(5)).await;
 
     Ok(())
 }
