@@ -1,14 +1,21 @@
-use std::{io, net::SocketAddr};
+use std::{collections::HashMap, io, net::SocketAddr};
 
+use serde::{Deserialize, Serialize};
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{mpsc, oneshot},
+    sync::{broadcast, mpsc, oneshot},
 };
 
 use futures_util::{pin_mut, StreamExt, TryStreamExt};
 use tungstenite::Message;
 
-#[derive(Debug)]
+/// The maximum number of games in the server
+const MAX_GAME_COUNT: usize = 16;
+
+/// The maximum number of player in a game
+const MAX_PLAYER_COUNT: usize = 10;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Player {
     name: String,
     points: i32,
@@ -20,22 +27,32 @@ impl Player {
     }
 }
 
-#[derive(Debug)]
-struct Game {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GameState {
     players: Vec<Player>,
 }
 
-impl Game {
-    fn new(player_name: String) -> Game {
-        Game {
+impl GameState {
+    fn new(player_name: String) -> GameState {
+        GameState {
             players: vec![Player::new(player_name)],
         }
     }
 }
 
-type GameChannelSender = mpsc::Sender<Game>;
-type CommandSender = oneshot::Sender<GameChannelSender>;
-type ManagerChannelSender = mpsc::Sender<Command>;
+// Types to communicate between the clients and the game manager
+type ManagerSender = mpsc::Sender<Command>;
+type CommandSender = oneshot::Sender<GameHandle>;
+
+// Types to communicate between the clients and a game
+type ClientSender = mpsc::Sender<PointChange>;
+type GameStateReceiver = broadcast::Receiver<GameState>;
+
+#[derive(Debug)]
+struct PointChange {
+    player_name: String,
+    new_points: i32,
+}
 
 #[derive(Debug)]
 enum Command {
@@ -45,21 +62,31 @@ enum Command {
     },
 }
 
+/// Structure for the manager to keep the channel accesses to pass to clients
+#[derive(Debug, Clone)]
+struct GameHandle {
+    client_sender: ClientSender,
+    game_state_receiver: GameStateReceiver,
+}
+
+/// Process incoming message from the client
 async fn process_incoming(
     msg: Message,
-    manager_tx: &ManagerChannelSender,
+    manager_tx: &ManagerSender,
 ) -> Result<(), tungstenite::Error> {
     println!("Received a message: {}", msg.to_text().unwrap());
 
     if msg.to_text().unwrap() == "CreateGame".to_string() {
         println!("Asking game manager to create a game...");
+
+        // Define a oneshot channel so the manager can send us back a GameHandle
         let (resp_tx, resp_rx) = oneshot::channel();
         let cmd = Command::CreateGame {
             player_name: "TestPlayer".to_string(),
             game_channel_resp: resp_tx,
         };
 
-        // Send the GET request
+        // Send the command
         manager_tx.send(cmd).await.unwrap();
 
         // Await the response
@@ -67,14 +94,12 @@ async fn process_incoming(
         println!("GOT = {:?}", res);
     }
 
+
+
     Ok(())
 }
 
-async fn handle_connection(
-    raw_stream: TcpStream,
-    manager_tx: ManagerChannelSender,
-    addr: SocketAddr,
-) {
+async fn handle_connection(raw_stream: TcpStream, manager_tx: ManagerSender, addr: SocketAddr) {
     println!("Incoming TCP connection from: {}", addr);
 
     let ws_stream = tokio_tungstenite::accept_async(raw_stream)
@@ -112,6 +137,8 @@ async fn main() -> Result<(), io::Error> {
     // Spawn game manager thread
     tokio::spawn(async move {
         // TODO record games in a hash map here
+        let mut games: HashMap<u32, GameHandle> = HashMap::new();
+
         while let Some(cmd) = manager_rx.recv().await {
             println!("Game manager received cmd {:?}", cmd);
             match cmd {
@@ -122,23 +149,31 @@ async fn main() -> Result<(), io::Error> {
                     // TODO handle errors
 
                     // New game channel
-                    let (game_channel_tx, mut game_channel_rx) = mpsc::channel(10);
+                    let (game_state_tx, mut game_state_rx) = broadcast::channel(MAX_PLAYER_COUNT);
+                    let (client_tx, mut client_rx) = mpsc::channel(MAX_PLAYER_COUNT);
+
+                    // Store new game
+                    let game_handle = GameHandle {
+                        client_sender: client_tx,
+                        game_state_receiver: game_state_rx,
+                    };
+                    games.insert(0, game_handle);
 
                     // Spawn new game thread
                     tokio::spawn(async move {
-                        let game = Game::new(player_name);
+                        let game = GameState::new(player_name);
                     });
 
-                    let _ = game_channel_resp.send(game_channel_tx);
+                    let _ = game_channel_resp.send(game_handle.clone());
                 }
             }
         }
     });
 
-    // Let's spawn the handling of each connection in a separate task.
+    // Spawn a thread for each client
     while let Ok((stream, addr)) = listener.accept().await {
-        let new_manager_tx = manager_tx.clone();
-        tokio::spawn(handle_connection(stream, new_manager_tx, addr));
+        // Give the player a sender to the manager
+        tokio::spawn(handle_connection(stream, manager_tx.clone(), addr));
     }
 
     Ok(())
