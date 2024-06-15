@@ -1,9 +1,8 @@
 use serde::{Deserialize, Serialize};
-use serial_int::SerialGenerator;
 
 use std::{
     net::SocketAddr,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
 };
 
 use tokio::{
@@ -25,16 +24,6 @@ const MAX_GAME_COUNT: usize = 16;
 type ClientSender = mpsc::Sender<ClientMessage>;
 type GameStateReceiver = broadcast::Receiver<GameState>;
 
-static ID_GENERATOR: OnceLock<Mutex<SerialGenerator<u32>>> = OnceLock::new();
-
-fn generate_id() -> u32 {
-    ID_GENERATOR
-        .get_or_init(|| Mutex::new(SerialGenerator::<u32>::new()))
-        .lock()
-        .expect("A thread panicked while trying to generate an ID.")
-        .generate()
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMessage {
     PlayerJoin(String),
@@ -44,12 +33,11 @@ pub enum ClientMessage {
     },
 }
 
-pub async fn launch_game_session() {
-    let addr = "127.0.0.1:8080";
+pub async fn launch_game_session(addr: SocketAddr) {
     // Create the event loop and TCP listener we'll accept connections on.
     let try_socket = TcpListener::bind(&addr).await;
     let listener = try_socket.expect("Failed to bind");
-    println!("Listening on: {}", addr);
+    println!("[Game server] Listening on: {}", addr);
 
     // Define game state
     let game_state = Arc::new(Mutex::new(GameState::new()));
@@ -116,8 +104,6 @@ async fn process_client_msg(
         }
     };
 
-    println!("Received a message: {}", &text_msg);
-
     // Check if msg is parseable
     let client_msg = match serde_json::from_str(text_msg) {
         Ok(msg) => msg,
@@ -144,12 +130,10 @@ async fn handle_connection(
     client_tx: ClientSender,
     mut game_state_rx: GameStateReceiver,
 ) {
-    println!("Incoming TCP connection from: {}", addr);
-
     let ws_stream = tokio_tungstenite::accept_async(raw_stream)
         .await
         .expect("Error during the websocket handshake occurred");
-    println!("WebSocket connection established: {}", addr);
+    println!("[Game server] New connection established: {}", addr);
 
     let (outgoing_client, incoming_client) = ws_stream.split();
 
@@ -161,10 +145,9 @@ async fn handle_connection(
         async move { process_client_msg(client_tx, msg).await }
     });
 
+    // Process incoming game statess
     let incoming_game_state = async_stream::stream! {
         while let Ok(game_state) = game_state_rx.recv().await {
-
-            println!("Got new game state {:?}.", &game_state);
             let json_string = serde_json::to_string(&game_state).expect("Game state should be serializable");
             yield tungstenite::Message::Text(json_string);
         }
@@ -175,5 +158,6 @@ async fn handle_connection(
     pin_mut!(received_game_state, incoming_client_processed);
     future::select(received_game_state, incoming_client_processed).await;
 
-    println!("{} disconnected", &addr);
+    println!("[Game server] {} disconnected", &addr);
+    // TODO have a map of who is connected and which address corresponds to which player
 }
