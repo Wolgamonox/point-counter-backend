@@ -37,4 +37,13 @@ impl GameState {
             self.players.push(Player::new(name));
         }
     }
+
+    pub fn remove_player(self: &mut Self, name: String) {
+        self.players
+            .iter()
+            .position(|p| p.name == name)
+            .inspect(|i| {
+                self.players.remove(*i);
+            });
+    }
 }

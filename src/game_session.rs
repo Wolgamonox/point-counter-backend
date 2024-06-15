@@ -1,9 +1,12 @@
 use serde::{Deserialize, Serialize};
 
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
+
+use tungstenite::Message;
 
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -26,7 +29,13 @@ type GameStateReceiver = broadcast::Receiver<GameState>;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMessage {
-    PlayerJoin(String),
+    PlayerJoin {
+        client_addr: SocketAddr,
+        player_name: String,
+    },
+    ClientDisconnect {
+        client_addr: SocketAddr,
+    },
     PointEvent {
         player_name: String,
         new_points: i32,
@@ -42,11 +51,15 @@ pub async fn launch_game_session(addr: SocketAddr) {
     // Define game state
     let game_state = Arc::new(Mutex::new(GameState::new()));
 
+    // Define map player client
+    let client_player_map = Arc::new(Mutex::new(HashMap::<SocketAddr, String>::new()));
+
     // Define channels to communicate with players
     let (game_state_tx, _game_state_rx) = broadcast::channel::<GameState>(MAX_GAME_COUNT);
     let (client_tx, mut client_rx) = mpsc::channel::<ClientMessage>(MAX_PLAYER_COUNT);
 
     let game_state = Arc::clone(&game_state);
+    let client_player_map = Arc::clone(&client_player_map);
     let session_game_tx = game_state_tx.clone();
 
     // Spawn a task that broadcasts a new gamestate whenever there is a point change
@@ -55,9 +68,32 @@ pub async fn launch_game_session(addr: SocketAddr) {
             // Get game state
             let mut game_state = game_state.lock().unwrap();
 
+            // Get client player map
+            let mut client_player_map = client_player_map.lock().unwrap();
+
             match client_msg {
-                ClientMessage::PlayerJoin(player_name) => {
+                ClientMessage::PlayerJoin {
+                    client_addr,
+                    player_name,
+                } => {
+                    // Save client addr and name so we can remove it from the game state on disconnect
+                    (*client_player_map).insert(client_addr.clone(), player_name.clone());
                     (*game_state).add_player(player_name);
+                }
+                ClientMessage::ClientDisconnect { client_addr } => {
+                    let player_name = (*client_player_map).get(&client_addr);
+
+                    match player_name {
+                        Some(player_name) => {
+                            // client disconnected, remove it from the game state and from the client player map
+                            (*game_state).remove_player(player_name.clone());
+                            (*client_player_map).remove(&client_addr);
+                        }
+                        None => (),
+                    }
+
+                    println!("Deleting player");
+                    println!("Game {:?} Map {:?}", game_state, client_player_map);
                 }
                 ClientMessage::PointEvent {
                     player_name,
@@ -81,39 +117,56 @@ pub async fn launch_game_session(addr: SocketAddr) {
     });
 
     // Spawn a task for each client
-    while let Ok((stream, addr)) = listener.accept().await {
+    while let Ok((stream, client_addr)) = listener.accept().await {
         // Give the player the channels to communicate
         let client_tx = client_tx.clone();
         let game_state_rx = game_state_tx.subscribe();
-        tokio::spawn(handle_connection(stream, addr, client_tx, game_state_rx));
+        tokio::spawn(handle_connection(
+            stream,
+            client_addr,
+            client_tx,
+            game_state_rx,
+        ));
     }
 }
 
+// fn parse_message(msg: )
+
 async fn process_client_msg(
     client_tx: ClientSender,
-    msg: tungstenite::Message,
+    msg: Message,
+    client_addr: SocketAddr,
 ) -> Result<(), tungstenite::Error> {
     // Check for disconnection
-    let text_msg = match msg.to_text() {
-        Ok(text) => text,
-        Err(_) => {
-            return Err(tungstenite::Error::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Disconnected",
-            )))
+    let mut text_msg: String = "{}".to_string();
+
+    match msg {
+        Message::Close(_) => {
+            text_msg =
+                serde_json::to_string(&ClientMessage::ClientDisconnect { client_addr }).unwrap();
         }
-    };
+        Message::Text(text) => {
+            text_msg = text;
+        }
+        _ => (),
+    }
+
+    println!("got Text msg: {}", text_msg);
 
     // Check if msg is parseable
-    let client_msg = match serde_json::from_str(text_msg) {
+    let client_msg = match serde_json::from_str(&text_msg) {
         Ok(msg) => msg,
         Err(_) => {
+            println!("Hello");
             return Err(tungstenite::Error::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "Could not process message",
-            )))
+            )));
         }
     };
+
+    // If the message is a player join, attach the corresponding socket address from the socket
+    
 
     match client_tx.send(client_msg).await {
         Ok(_) => Ok(()),
@@ -126,14 +179,14 @@ async fn process_client_msg(
 
 async fn handle_connection(
     raw_stream: TcpStream,
-    addr: SocketAddr,
+    client_addr: SocketAddr,
     client_tx: ClientSender,
     mut game_state_rx: GameStateReceiver,
 ) {
     let ws_stream = tokio_tungstenite::accept_async(raw_stream)
         .await
         .expect("Error during the websocket handshake occurred");
-    println!("[Game server] New connection established: {}", addr);
+    println!("[Game server] New connection established: {}", client_addr);
 
     let (outgoing_client, incoming_client) = ws_stream.split();
 
@@ -142,14 +195,14 @@ async fn handle_connection(
     // else if the messages are related to point change, send to game channel if it exists
     let incoming_client_processed = incoming_client.try_for_each(|msg| {
         let client_tx = client_tx.clone();
-        async move { process_client_msg(client_tx, msg).await }
+        async move { process_client_msg(client_tx, msg, client_addr).await }
     });
 
     // Process incoming game statess
     let incoming_game_state = async_stream::stream! {
         while let Ok(game_state) = game_state_rx.recv().await {
             let json_string = serde_json::to_string(&game_state).expect("Game state should be serializable");
-            yield tungstenite::Message::Text(json_string);
+            yield Message::Text(json_string);
         }
     };
 
@@ -158,6 +211,5 @@ async fn handle_connection(
     pin_mut!(received_game_state, incoming_client_processed);
     future::select(received_game_state, incoming_client_processed).await;
 
-    println!("[Game server] {} disconnected", &addr);
-    // TODO have a map of who is connected and which address corresponds to which player
+    println!("[Game server] {} disconnected", &client_addr);
 }

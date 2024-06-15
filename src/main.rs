@@ -4,9 +4,8 @@ pub mod game_session;
 use crate::game_session::{launch_game_session, ClientMessage};
 
 use std::{
-    collections::HashSet,
     io,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::OnceLock,
 };
 
@@ -17,11 +16,8 @@ use tokio::{
     sync::Mutex,
 };
 
-use std::{net::SocketAddr, sync::Arc};
-
 // TODO: add obfuscation of ports with sqids crate
 type Port = u16;
-type GameSessions = Arc<Mutex<HashSet<Port>>>;
 
 static ID_GENERATOR: OnceLock<Mutex<SerialGenerator<Port>>> = OnceLock::new();
 
@@ -42,7 +38,11 @@ async fn main() -> Result<(), io::Error> {
     // Test
     println!(
         "{}",
-        serde_json::to_string(&ClientMessage::PlayerJoin("Gaston".to_string())).unwrap()
+        serde_json::to_string(&ClientMessage::PlayerJoin {
+            client_addr: "127.0.0.1:15112".parse().unwrap(),
+            player_name: "Gaston".to_string()
+        })
+        .unwrap()
     );
     println!(
         "{}",
@@ -53,26 +53,22 @@ async fn main() -> Result<(), io::Error> {
         .unwrap()
     );
 
-    //TODO  Add code here to wait for a message before launching a game session
     let server_addr = SocketAddr::new(BASE_ADDR, BASE_PORT);
+
     // Create the event loop and TCP listener we'll accept connections on.
     let try_socket = TcpListener::bind(&server_addr).await;
     let listener = try_socket.expect("Failed to bind");
     println!("[Main server] Listening on: {}", server_addr);
 
-    // Define games
-    let game_sessions: GameSessions = Arc::new(Mutex::new(HashSet::new()));
-
     // Launch a game session
     while let Ok((stream, _)) = listener.accept().await {
-        let game_sessions = game_sessions.clone();
-        tokio::spawn(accept_connection(stream, game_sessions));
+        tokio::spawn(accept_connection(stream));
     }
 
     Ok(())
 }
 
-async fn accept_connection(stream: TcpStream, game_sessions: GameSessions) {
+async fn accept_connection(stream: TcpStream) {
     let addr = stream
         .peer_addr()
         .expect("Connected streams should have a peer address");
@@ -94,11 +90,6 @@ async fn accept_connection(stream: TcpStream, game_sessions: GameSessions) {
                     let port = BASE_PORT + generate_id().await;
                     let addr = SocketAddr::new(BASE_ADDR, port);
 
-                    // add address to games
-                    let mut game_sessions = game_sessions.lock().await;
-                    game_sessions.insert(port);
-
-                    // TODO add a channel between main thread to keep track of open game sessions
                     tokio::spawn(launch_game_session(addr));
 
                     println!("[Main server] Creating a game hosted on {port}");
