@@ -30,7 +30,7 @@ type GameStateReceiver = broadcast::Receiver<GameState>;
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMessage {
     PlayerJoin {
-        client_addr: SocketAddr,
+        client_addr: Option<SocketAddr>,
         player_name: String,
     },
     ClientDisconnect {
@@ -77,7 +77,12 @@ pub async fn launch_game_session(addr: SocketAddr) {
                     player_name,
                 } => {
                     // Save client addr and name so we can remove it from the game state on disconnect
-                    (*client_player_map).insert(client_addr.clone(), player_name.clone());
+                    (*client_player_map).insert(
+                        client_addr
+                            .expect("The client address should have been attached.")
+                            .clone(),
+                        player_name.clone(),
+                    );
                     (*game_state).add_player(player_name);
                 }
                 ClientMessage::ClientDisconnect { client_addr } => {
@@ -132,6 +137,10 @@ pub async fn launch_game_session(addr: SocketAddr) {
 
 // fn parse_message(msg: )
 
+fn new_tunsgenite_error(msg: &str) -> tungstenite::Error {
+    tungstenite::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, msg))
+}
+
 async fn process_client_msg(
     client_tx: ClientSender,
     msg: Message,
@@ -154,27 +163,30 @@ async fn process_client_msg(
     println!("got Text msg: {}", text_msg);
 
     // Check if msg is parseable
-    let client_msg = match serde_json::from_str(&text_msg) {
+    let mut client_msg = match serde_json::from_str(&text_msg) {
         Ok(msg) => msg,
         Err(_) => {
-            println!("Hello");
-            return Err(tungstenite::Error::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Could not process message",
-            )));
+            return Err(new_tunsgenite_error("Could not process message"));
         }
     };
 
-    // If the message is a player join, attach the corresponding socket address from the socket
-    
-
-    match client_tx.send(client_msg).await {
-        Ok(_) => Ok(()),
-        Err(e) => Err(tungstenite::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            e.to_string(),
-        ))),
+    // If the message is a player join, attach the corresponding client socket address
+    if let ClientMessage::PlayerJoin {
+        client_addr: _,
+        player_name,
+    } = &mut client_msg
+    {
+        client_msg = ClientMessage::PlayerJoin {
+            client_addr: Some(client_addr),
+            player_name: player_name.clone(),
+        };
     }
+
+    // Send message to the channel
+    client_tx
+        .send(client_msg)
+        .await
+        .map_err(|_| new_tunsgenite_error("Could not send message to client"))
 }
 
 async fn handle_connection(

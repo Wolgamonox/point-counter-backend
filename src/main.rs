@@ -39,7 +39,7 @@ async fn main() -> Result<(), io::Error> {
     println!(
         "{}",
         serde_json::to_string(&ClientMessage::PlayerJoin {
-            client_addr: "127.0.0.1:15112".parse().unwrap(),
+            client_addr: None,
             player_name: "Gaston".to_string()
         })
         .unwrap()
