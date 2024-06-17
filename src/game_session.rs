@@ -121,6 +121,9 @@ pub async fn launch_game_session(addr: SocketAddr) {
         }
     });
 
+    // TODO: terminate game session when no player event for a certain timeout
+    // TODO: terminate game session when no players in game for 10 minutes
+
     // Spawn a task for each client
     while let Ok((stream, client_addr)) = listener.accept().await {
         // Give the player the channels to communicate

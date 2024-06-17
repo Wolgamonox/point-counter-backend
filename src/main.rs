@@ -19,6 +19,7 @@ use tokio::{
 // TODO: add obfuscation of ports with sqids crate
 type Port = u16;
 
+// TODO recreate generator to keep track of what games are still alive to see what ports are available or not
 static ID_GENERATOR: OnceLock<Mutex<SerialGenerator<Port>>> = OnceLock::new();
 
 async fn generate_id() -> Port {
