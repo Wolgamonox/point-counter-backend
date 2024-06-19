@@ -4,6 +4,7 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use tungstenite::Message;
@@ -11,6 +12,7 @@ use tungstenite::Message;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{broadcast, mpsc},
+    time::Instant,
 };
 
 use futures_util::{future, pin_mut, stream::TryStreamExt, StreamExt};
@@ -22,6 +24,9 @@ const MAX_PLAYER_COUNT: usize = 10;
 
 /// The maximum number of games in the server
 const MAX_GAME_COUNT: usize = 16;
+
+/// The timeout before a game session is terminated when there are no players
+const NO_PLAYER_TIMEOUT: Duration = Duration::from_secs(20);
 
 // Types to communicate between the clients and a game
 type ClientSender = mpsc::Sender<ClientMessage>;
@@ -58,12 +63,14 @@ pub async fn launch_game_session(addr: SocketAddr) {
     let (game_state_tx, _game_state_rx) = broadcast::channel::<GameState>(MAX_GAME_COUNT);
     let (client_tx, mut client_rx) = mpsc::channel::<ClientMessage>(MAX_PLAYER_COUNT);
 
-    let game_state = Arc::clone(&game_state);
-    let client_player_map = Arc::clone(&client_player_map);
     let session_game_tx = game_state_tx.clone();
 
     // Spawn a task that broadcasts a new gamestate whenever there is a point change
     tokio::spawn(async move {
+        // Variables to check if the timeout was reached when there are no players
+        let mut timeout_timer_started = false;
+        let mut timeout_timer_start = Instant::now();
+
         while let Some(client_msg) = client_rx.recv().await {
             // Get game state
             let mut game_state = game_state.lock().unwrap();
@@ -118,6 +125,28 @@ pub async fn launch_game_session(addr: SocketAddr) {
 
             // Send updated game state down channel
             session_game_tx.send(game_state.clone()).unwrap();
+
+
+            // TODO fix this, this is not an infinite loop that checks oftens, it is a only when we receive messages
+            println!("Hello");
+
+            // Verify if there are still players in the game
+            if client_player_map.is_empty() && !timeout_timer_started {
+                timeout_timer_start = Instant::now();
+                timeout_timer_started = true;
+            }
+
+            // reset timer to 0 if someone joined in the meantime
+            if !client_player_map.is_empty() && timeout_timer_started {
+                timeout_timer_started = false;
+            }
+
+            // Kill session if the timeout was reached
+            if timeout_timer_started && (Instant::now() - timeout_timer_start >= NO_PLAYER_TIMEOUT)
+            {
+                println!("Timeout completed! Killing game session");
+                break;
+            }
         }
     });
 
@@ -137,8 +166,6 @@ pub async fn launch_game_session(addr: SocketAddr) {
         ));
     }
 }
-
-// fn parse_message(msg: )
 
 fn new_tunsgenite_error(msg: &str) -> tungstenite::Error {
     tungstenite::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, msg))

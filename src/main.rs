@@ -6,30 +6,17 @@ use crate::game_session::{launch_game_session, ClientMessage};
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::OnceLock,
+    ops::Not,
 };
 
 use futures_util::{SinkExt, StreamExt};
-use serial_int::SerialGenerator;
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::Mutex,
+    task::JoinHandle,
 };
 
 // TODO: add obfuscation of ports with sqids crate
 type Port = u16;
-
-// TODO recreate generator to keep track of what games are still alive to see what ports are available or not
-static ID_GENERATOR: OnceLock<Mutex<SerialGenerator<Port>>> = OnceLock::new();
-
-async fn generate_id() -> Port {
-    // Generate id starting from 1
-    ID_GENERATOR
-        .get_or_init(|| Mutex::new(SerialGenerator::<Port>::with_init_value(1)))
-        .lock()
-        .await
-        .generate()
-}
 
 const BASE_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 const BASE_PORT: Port = 9000;
@@ -69,6 +56,8 @@ async fn main() -> Result<(), io::Error> {
     Ok(())
 }
 
+struct GameSession(Port, JoinHandle<()>);
+
 async fn accept_connection(stream: TcpStream) {
     let addr = stream
         .peer_addr()
@@ -82,16 +71,44 @@ async fn accept_connection(stream: TcpStream) {
 
     let (mut write, mut read) = ws_stream.split();
 
+    let mut game_sessions: Vec<GameSession> = Vec::new();
+    let mut available_ports: Vec<Port> = (9001..9021 as Port).collect();
+
     while let Some(msg) = read.next().await {
+        // Verify if game sessions are finished to see if we can free some ports
+        game_sessions = game_sessions
+            .into_iter()
+            .filter(|session| {
+                if session.1.is_finished() {
+                    // add back the port to the available ports
+                    available_ports.push(session.0);
+                }
+                // keep only sessions that are not finished
+                session.1.is_finished().not()
+            })
+            .collect();
+
         match msg {
             Ok(msg) => {
                 let text_msg = msg.to_text().unwrap();
 
                 if text_msg == "CreateGame".to_string() {
-                    let port = BASE_PORT + generate_id().await;
+                    let port = available_ports.pop();
+
+                    let Some(port) = port else {
+                        // No game server available
+                        write
+                            .send(tungstenite::Message::Text("null".to_string()))
+                            .await
+                            .expect("Failed to send response");
+                        break;
+                    };
+
                     let addr = SocketAddr::new(BASE_ADDR, port);
 
-                    tokio::spawn(launch_game_session(addr));
+                    let session_handle = tokio::spawn(launch_game_session(addr));
+
+                    game_sessions.push(GameSession(port, session_handle));
 
                     println!("[Main server] Creating a game hosted on {port}");
 
