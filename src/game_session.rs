@@ -1,17 +1,16 @@
 use serde::{Deserialize, Serialize};
 
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use tungstenite::Message;
 
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{broadcast, mpsc},
+    sync::{
+        broadcast::{self, Sender},
+        mpsc::{self, Receiver},
+        Mutex,
+    },
     time::Instant,
 };
 
@@ -26,7 +25,10 @@ const MAX_PLAYER_COUNT: usize = 10;
 const MAX_GAME_COUNT: usize = 16;
 
 /// The timeout before a game session is terminated when there are no players
-const NO_PLAYER_TIMEOUT: Duration = Duration::from_secs(20);
+const NO_PLAYER_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+/// The interval at which we check that there are no more players
+const NO_PLAYER_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 // Types to communicate between the clients and a game
 type ClientSender = mpsc::Sender<ClientMessage>;
@@ -61,110 +63,165 @@ pub async fn launch_game_session(addr: SocketAddr) {
 
     // Define channels to communicate with players
     let (game_state_tx, _game_state_rx) = broadcast::channel::<GameState>(MAX_GAME_COUNT);
-    let (client_tx, mut client_rx) = mpsc::channel::<ClientMessage>(MAX_PLAYER_COUNT);
+    let (client_tx, client_rx) = mpsc::channel::<ClientMessage>(MAX_PLAYER_COUNT);
 
     let session_game_tx = game_state_tx.clone();
 
     // Spawn a task that broadcasts a new gamestate whenever there is a point change
-    tokio::spawn(async move {
-        // Variables to check if the timeout was reached when there are no players
-        let mut timeout_timer_started = false;
-        let mut timeout_timer_start = Instant::now();
+    let game_broadcast_handler = tokio::spawn(game_state_broadcast(
+        game_state,
+        Arc::clone(&client_player_map),
+        client_rx,
+        session_game_tx,
+    ));
 
-        while let Some(client_msg) = client_rx.recv().await {
-            // Get game state
-            let mut game_state = game_state.lock().unwrap();
-
-            // Get client player map
-            let mut client_player_map = client_player_map.lock().unwrap();
-
-            match client_msg {
-                ClientMessage::PlayerJoin {
-                    client_addr,
-                    player_name,
-                } => {
-                    // Save client addr and name so we can remove it from the game state on disconnect
-                    (*client_player_map).insert(
-                        client_addr
-                            .expect("The client address should have been attached.")
-                            .clone(),
-                        player_name.clone(),
-                    );
-                    (*game_state).add_player(player_name);
-                }
-                ClientMessage::ClientDisconnect { client_addr } => {
-                    let player_name = (*client_player_map).get(&client_addr);
-
-                    match player_name {
-                        Some(player_name) => {
-                            // client disconnected, remove it from the game state and from the client player map
-                            (*game_state).remove_player(player_name.clone());
-                            (*client_player_map).remove(&client_addr);
-                        }
-                        None => (),
-                    }
-
-                    println!("Deleting player");
-                    println!("Game {:?} Map {:?}", game_state, client_player_map);
-                }
-                ClientMessage::PointEvent {
-                    player_name,
-                    new_points,
-                } => {
-                    // Change points of player
-                    let player = (*game_state)
-                        .players
-                        .iter_mut()
-                        .find(|p| p.name == player_name);
-
-                    if let Some(player) = player {
-                        player.add_points(new_points);
-                    }
-                }
-            }
-
-            // Send updated game state down channel
-            session_game_tx.send(game_state.clone()).unwrap();
-
-
-            // TODO fix this, this is not an infinite loop that checks oftens, it is a only when we receive messages
-            println!("Hello");
-
-            // Verify if there are still players in the game
-            if client_player_map.is_empty() && !timeout_timer_started {
-                timeout_timer_start = Instant::now();
-                timeout_timer_started = true;
-            }
-
-            // reset timer to 0 if someone joined in the meantime
-            if !client_player_map.is_empty() && timeout_timer_started {
-                timeout_timer_started = false;
-            }
-
-            // Kill session if the timeout was reached
-            if timeout_timer_started && (Instant::now() - timeout_timer_start >= NO_PLAYER_TIMEOUT)
-            {
-                println!("Timeout completed! Killing game session");
-                break;
-            }
+    // Spawn a task for handling player connections
+    let connection_handler = tokio::spawn(async move {
+        // Spawn a task for each client
+        while let Ok((stream, client_addr)) = listener.accept().await {
+            // Give the player the channels to communicate
+            let client_tx = client_tx.clone();
+            let game_state_rx = game_state_tx.subscribe();
+            tokio::spawn(handle_connection(
+                stream,
+                client_addr,
+                client_tx,
+                game_state_rx,
+            ));
         }
     });
 
     // TODO: terminate game session when no player event for a certain timeout
-    // TODO: terminate game session when no players in game for 10 minutes
 
-    // Spawn a task for each client
-    while let Ok((stream, client_addr)) = listener.accept().await {
-        // Give the player the channels to communicate
-        let client_tx = client_tx.clone();
-        let game_state_rx = game_state_tx.subscribe();
-        tokio::spawn(handle_connection(
-            stream,
-            client_addr,
-            client_tx,
-            game_state_rx,
-        ));
+    // Variables to check if the timeout was reached when there are no players
+    let mut timeout_timer_started = false;
+    let mut timeout_timer_start = Instant::now();
+
+    loop {
+        // Check only every n seconds if the game is empty
+        tokio::time::sleep(NO_PLAYER_CHECK_INTERVAL).await;
+
+        // Get client player map
+        let client_player_map = client_player_map.lock().await;
+        // Verify if there are still players in the game
+        if client_player_map.is_empty() && !timeout_timer_started {
+            timeout_timer_start = Instant::now();
+            timeout_timer_started = true;
+        }
+
+        // reset timer to 0 if someone joined in the meantime
+        if !client_player_map.is_empty() && timeout_timer_started {
+            timeout_timer_started = false;
+        }
+
+        // Kill session if the timeout was reached
+        if timeout_timer_started && (Instant::now() - timeout_timer_start >= NO_PLAYER_TIMEOUT) {
+            println!("Timeout completed! Killing game session");
+            game_broadcast_handler.abort();
+            connection_handler.abort();
+            break;
+        }
     }
+}
+
+async fn game_state_broadcast(
+    game_state: Arc<Mutex<GameState>>,
+    client_player_map: Arc<Mutex<HashMap<SocketAddr, String>>>,
+    mut client_rx: Receiver<ClientMessage>,
+    session_game_tx: Sender<GameState>,
+) {
+    while let Some(client_msg) = client_rx.recv().await {
+        // Get game state
+        let mut game_state = game_state.lock().await;
+
+        // Get client player map
+        let mut client_player_map = client_player_map.lock().await;
+
+        match client_msg {
+            ClientMessage::PlayerJoin {
+                client_addr,
+                player_name,
+            } => {
+                // Save client addr and name so we can remove it from the game state on disconnect
+                (*client_player_map).insert(
+                    client_addr
+                        .expect("The client address should have been attached.")
+                        .clone(),
+                    player_name.clone(),
+                );
+                (*game_state).add_player(player_name);
+            }
+            ClientMessage::ClientDisconnect { client_addr } => {
+                let player_name = (*client_player_map).get(&client_addr);
+
+                match player_name {
+                    Some(player_name) => {
+                        // client disconnected, remove it from the game state and from the client player map
+                        (*game_state).remove_player(player_name.clone());
+                        (*client_player_map).remove(&client_addr);
+                    }
+                    None => (),
+                }
+
+                println!("Deleting player");
+                println!("Game {:?} Map {:?}", game_state, client_player_map);
+            }
+            ClientMessage::PointEvent {
+                player_name,
+                new_points,
+            } => {
+                // Change points of player
+                let player = (*game_state)
+                    .players
+                    .iter_mut()
+                    .find(|p| p.name == player_name);
+
+                if let Some(player) = player {
+                    player.add_points(new_points);
+                }
+            }
+        }
+
+        // Send updated game state down channel
+        session_game_tx.send(game_state.clone()).unwrap();
+    }
+}
+
+async fn handle_connection(
+    raw_stream: TcpStream,
+    client_addr: SocketAddr,
+    client_tx: ClientSender,
+    mut game_state_rx: GameStateReceiver,
+) {
+    let ws_stream = tokio_tungstenite::accept_async(raw_stream)
+        .await
+        .expect("Error during the websocket handshake occurred");
+    println!("[Game server] New connection established: {}", client_addr);
+
+    let (outgoing_client, incoming_client) = ws_stream.split();
+
+    // Handle messages incoming from the client
+    // if the message is CreateGame or JoinGame, send to the game manager channel
+    // else if the messages are related to point change, send to game channel if it exists
+    let incoming_client_processed = incoming_client.try_for_each(|msg| {
+        let client_tx = client_tx.clone();
+        async move { process_client_msg(client_tx, msg, client_addr).await }
+    });
+
+    // Process incoming game statess
+    let incoming_game_state = async_stream::stream! {
+        while let Ok(game_state) = game_state_rx.recv().await {
+            let json_string = serde_json::to_string(&game_state).expect("Game state should be serializable");
+            yield Message::Text(json_string);
+        }
+    };
+
+    let received_game_state = incoming_game_state.map(Ok).forward(outgoing_client);
+
+    pin_mut!(received_game_state, incoming_client_processed);
+    future::select(received_game_state, incoming_client_processed).await;
+
+    println!("[Game server] {} disconnected", &client_addr);
 }
 
 fn new_tunsgenite_error(msg: &str) -> tungstenite::Error {
@@ -217,41 +274,4 @@ async fn process_client_msg(
         .send(client_msg)
         .await
         .map_err(|_| new_tunsgenite_error("Could not send message to client"))
-}
-
-async fn handle_connection(
-    raw_stream: TcpStream,
-    client_addr: SocketAddr,
-    client_tx: ClientSender,
-    mut game_state_rx: GameStateReceiver,
-) {
-    let ws_stream = tokio_tungstenite::accept_async(raw_stream)
-        .await
-        .expect("Error during the websocket handshake occurred");
-    println!("[Game server] New connection established: {}", client_addr);
-
-    let (outgoing_client, incoming_client) = ws_stream.split();
-
-    // Handle messages incoming from the client
-    // if the message is CreateGame or JoinGame, send to the game manager channel
-    // else if the messages are related to point change, send to game channel if it exists
-    let incoming_client_processed = incoming_client.try_for_each(|msg| {
-        let client_tx = client_tx.clone();
-        async move { process_client_msg(client_tx, msg, client_addr).await }
-    });
-
-    // Process incoming game statess
-    let incoming_game_state = async_stream::stream! {
-        while let Ok(game_state) = game_state_rx.recv().await {
-            let json_string = serde_json::to_string(&game_state).expect("Game state should be serializable");
-            yield Message::Text(json_string);
-        }
-    };
-
-    let received_game_state = incoming_game_state.map(Ok).forward(outgoing_client);
-
-    pin_mut!(received_game_state, incoming_client_processed);
-    future::select(received_game_state, incoming_client_processed).await;
-
-    println!("[Game server] {} disconnected", &client_addr);
 }
