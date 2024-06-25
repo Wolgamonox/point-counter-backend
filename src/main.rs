@@ -7,11 +7,13 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     ops::Not,
+    sync::Arc,
 };
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::{
     net::{TcpListener, TcpStream},
+    sync::Mutex,
     task::JoinHandle,
 };
 
@@ -20,6 +22,17 @@ type Port = u16;
 
 const BASE_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 const BASE_PORT: Port = 9000;
+
+struct GameSession {
+    port: Port,
+    handle: JoinHandle<()>,
+}
+
+impl GameSession {
+    fn new(port: Port, handle: JoinHandle<()>) -> GameSession {
+        GameSession { port, handle }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), io::Error> {
@@ -48,18 +61,27 @@ async fn main() -> Result<(), io::Error> {
     let listener = try_socket.expect("Failed to bind");
     println!("[Main server] Listening on: {}", server_addr);
 
+    let game_sessions = Arc::new(Mutex::new(Vec::<GameSession>::new()));
+    let available_ports = Arc::new(Mutex::new(Vec::from_iter(9001..9021 as Port)));
+
     // Launch a game session
     while let Ok((stream, _)) = listener.accept().await {
-        tokio::spawn(accept_connection(stream));
+        tokio::spawn(accept_connection(
+            stream,
+            Arc::clone(&game_sessions),
+            Arc::clone(&available_ports),
+        ));
     }
 
     Ok(())
 }
 
-struct GameSession(Port, JoinHandle<()>);
-
-async fn accept_connection(stream: TcpStream) {
-    let addr = stream
+async fn accept_connection(
+    stream: TcpStream,
+    game_sessions: Arc<Mutex<Vec<GameSession>>>,
+    available_ports: Arc<Mutex<Vec<Port>>>,
+) {
+    let client_addr: SocketAddr = stream
         .peer_addr()
         .expect("Connected streams should have a peer address");
 
@@ -67,26 +89,24 @@ async fn accept_connection(stream: TcpStream) {
         .await
         .expect("Error during the websocket handshake occurred");
 
-    println!("[Main Server] New connection: {}", addr);
+    println!("[Main Server] New connection: {}", client_addr);
 
     let (mut write, mut read) = ws_stream.split();
 
-    let mut game_sessions: Vec<GameSession> = Vec::new();
-    let mut available_ports: Vec<Port> = (9001..9021 as Port).collect();
+    // get the game sessions and available ports
+    let mut game_sessions = game_sessions.lock().await;
+    let mut available_ports = available_ports.lock().await;
 
     while let Some(msg) = read.next().await {
         // Verify if game sessions are finished to see if we can free some ports
-        game_sessions = game_sessions
-            .into_iter()
-            .filter(|session| {
-                if session.1.is_finished() {
-                    // add back the port to the available ports
-                    available_ports.push(session.0);
-                }
-                // keep only sessions that are not finished
-                session.1.is_finished().not()
-            })
-            .collect();
+        game_sessions.retain(|session| {
+            if session.handle.is_finished() {
+                // add back the port to the available ports
+                available_ports.push(session.port);
+            }
+            // keep only sessions that are not finished
+            session.handle.is_finished().not()
+        });
 
         match msg {
             Ok(msg) => {
@@ -108,9 +128,10 @@ async fn accept_connection(stream: TcpStream) {
 
                     let session_handle = tokio::spawn(launch_game_session(addr));
 
-                    game_sessions.push(GameSession(port, session_handle));
+                    game_sessions.push(GameSession::new(port, session_handle));
 
                     println!("[Main server] Creating a game hosted on {port}");
+                    println!("Available ports: {available_ports:?}");
 
                     // Send back port to the client so it can connect to the game session
                     write
@@ -124,4 +145,5 @@ async fn accept_connection(stream: TcpStream) {
             }
         }
     }
+    println!("[Main server] Disconnected: {}", client_addr);
 }
