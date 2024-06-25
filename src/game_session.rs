@@ -49,14 +49,14 @@ pub enum ClientMessage {
     },
 }
 
-pub async fn launch_game_session(addr: SocketAddr) {
+pub async fn launch_game_session(addr: SocketAddr, goal: u32) {
     // Create the event loop and TCP listener we'll accept connections on.
     let try_socket = TcpListener::bind(&addr).await;
     let listener = try_socket.expect("Failed to bind");
     println!("[Game server] Listening on: {}", addr);
 
     // Define game state
-    let game_state = Arc::new(Mutex::new(GameState::new()));
+    let game_state = Arc::new(Mutex::new(GameState::new(goal)));
 
     // Define map player client
     let client_player_map = Arc::new(Mutex::new(HashMap::<SocketAddr, String>::new()));
@@ -116,7 +116,10 @@ pub async fn launch_game_session(addr: SocketAddr) {
 
         // Kill session if the timeout was reached
         if timeout_timer_started && (Instant::now() - timeout_timer_start >= NO_PLAYER_TIMEOUT) {
-            println!("Timeout completed! Killing game session");
+            println!(
+                "[Game server] Timeout completed! Killing game session {}",
+                addr.port()
+            );
             game_broadcast_handler.abort();
             connection_handler.abort();
             break;
@@ -246,8 +249,6 @@ async fn process_client_msg(
         }
         _ => (),
     }
-
-    println!("got Text msg: {}", text_msg);
 
     // Check if msg is parseable
     let mut client_msg = match serde_json::from_str(&text_msg) {

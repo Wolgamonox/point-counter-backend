@@ -21,14 +21,14 @@ impl Player {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameState {
     pub players: Vec<Player>,
-    pub new: bool,
+    pub goal: u32,
 }
 
 impl GameState {
-    pub fn new() -> GameState {
+    pub fn new(goal: u32) -> GameState {
         GameState {
             players: vec![],
-            new: true,
+            goal,
         }
     }
 

@@ -112,7 +112,9 @@ async fn accept_connection(
             Ok(msg) => {
                 let text_msg = msg.to_text().unwrap();
 
-                if text_msg == "CreateGame".to_string() {
+                if text_msg.starts_with("CreateGame") {
+                    // TODO handle errors properly
+                    let goal: u32 = text_msg.split(":").last().unwrap().parse().unwrap();
                     let port = available_ports.pop();
 
                     let Some(port) = port else {
@@ -126,12 +128,11 @@ async fn accept_connection(
 
                     let addr = SocketAddr::new(BASE_ADDR, port);
 
-                    let session_handle = tokio::spawn(launch_game_session(addr));
+                    let session_handle = tokio::spawn(launch_game_session(addr, goal));
 
                     game_sessions.push(GameSession::new(port, session_handle));
 
                     println!("[Main server] Creating a game hosted on {port}");
-                    println!("Available ports: {available_ports:?}");
 
                     // Send back port to the client so it can connect to the game session
                     write
