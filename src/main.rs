@@ -20,8 +20,8 @@ use tokio::{
 // TODO: add obfuscation of ports with sqids crate
 type Port = u16;
 
-const BASE_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
-const BASE_PORT: Port = 9000;
+const BASE_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
+const BASE_PORT: Port = 9100;
 
 struct GameSession {
     port: Port,
@@ -62,7 +62,7 @@ async fn main() -> Result<(), io::Error> {
     println!("[Main server] Listening on: {}", server_addr);
 
     let game_sessions = Arc::new(Mutex::new(Vec::<GameSession>::new()));
-    let available_ports = Arc::new(Mutex::new(Vec::from_iter(9001..9021 as Port)));
+    let available_ports = Arc::new(Mutex::new(Vec::from_iter((1..21 as Port).map(|e| BASE_PORT + e))));
 
     // Launch a game session
     while let Ok((stream, _)) = listener.accept().await {
