@@ -1,8 +1,0 @@
-services:
-  server:
-    build:
-      context: .
-      target: final
-    ports:
-      - 9100-9120:9100-9120
-
