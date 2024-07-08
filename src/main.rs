@@ -21,7 +21,7 @@ use tokio::{
 type Port = u16;
 
 const BASE_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
-const BASE_PORT: Port = 50000;
+const BASE_PORT: Port = 45300;
 
 struct GameSession {
     port: Port,
