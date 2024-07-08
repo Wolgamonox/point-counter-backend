@@ -180,7 +180,7 @@ async fn game_state_broadcast(
                     .find(|p| p.name == player_name);
 
                 if let Some(player) = player {
-                    player.add_points(new_points);
+                    player.set_points(new_points);
                 }
             }
         }

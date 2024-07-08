@@ -13,8 +13,8 @@ impl Player {
         Player { name, points: 0 }
     }
 
-    pub fn add_points(self: &mut Self, points: i32) {
-        self.points += points;
+    pub fn set_points(self: &mut Self, points: i32) {
+        self.points = points;
     }
 }
 
