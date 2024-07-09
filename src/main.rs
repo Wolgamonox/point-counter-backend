@@ -5,7 +5,7 @@ use crate::game_session::{launch_game_session, ClientMessage};
 
 use std::{
     io,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     ops::Not,
     sync::Arc,
 };
@@ -20,7 +20,7 @@ use tokio::{
 // TODO: add obfuscation of ports with sqids crate
 type Port = u16;
 
-const BASE_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
+const BASE_ADDR: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2a04, 0xee41, 0x84, 0xbbf0, 0xaa91, 0x97b4, 0xffe9, 0x92d0));
 const BASE_PORT: Port = 45300;
 
 struct GameSession {
